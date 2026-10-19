@@ -16,14 +16,25 @@
 
 #include "test/dynamic_test.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/filesystem/path.hpp>
 
 #include "absl/random/distributions.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/string_view.h"
 #include "absl/strings/substitute.h"
 #include "benchmark/benchmark.h"
 #include "dynamic_test.h"
@@ -39,6 +50,33 @@
 
 namespace service_extensions_samples {
 namespace {
+
+// Calculates the Resident Set Size (RSS) of a mapped region of memory.
+// This function expects a view of page-aligned memory.
+absl::StatusOr<uint64_t> GetResidentMemoryUsageBytes(
+    absl::string_view memory) {
+  static const uint64_t kPageSize = []() { return sysconf(_SC_PAGESIZE); }();
+  if (memory.data() == nullptr || memory.empty()) {
+    return absl::InvalidArgumentError("Memory is empty.");
+  }
+  uintptr_t base_address = reinterpret_cast<uintptr_t>(memory.data());
+  if ((base_address % kPageSize) != 0) {
+    return absl::InvalidArgumentError("Memory is not aligned.");
+  }
+  size_t num_pages = (memory.size() + kPageSize - 1) / kPageSize;
+  std::vector<unsigned char> page_status(num_pages);
+  if (mincore(reinterpret_cast<void*>(base_address), memory.size(),
+              page_status.data()) != 0) {
+    return absl::ErrnoToStatus(errno, "mincore failed.");
+  }
+  // Per https://man7.org/linux/man-pages/man2/mincore.2.html, check the
+  // least-significant bit only.
+  uint64_t resident_pages = 0;
+  for (size_t i = 0; i < num_pages; ++i) {
+    if (page_status[i] & 1) resident_pages++;
+  }
+  return resident_pages * kPageSize;
+}
 
 // Helper to read data from a path which may be relative to the test config.
 absl::StatusOr<std::string> ReadContent(const std::string& path,
@@ -429,9 +467,24 @@ void DynamicTest::TestBody() {
 void DynamicTest::EmitStats(benchmark::State& state,
                             proxy_wasm::PluginHandleBase& handle,
                             const TestContext& context) {
-  state.counters["WasmMemoryB"] = benchmark::Counter(
-      handle.wasm()->wasm_vm()->getMemorySize(), benchmark::Counter::kDefaults,
-      benchmark::Counter::kIs1024);
+  uint64_t memory_size = handle.wasm()->wasm_vm()->getMemorySize();
+  state.counters["WasmMemoryVsz"] = benchmark::Counter(
+      memory_size, benchmark::Counter::kDefaults, benchmark::Counter::kIs1024);
+  std::optional<std::string_view> memory_view =
+      handle.wasm()->wasm_vm()->getMemory(0, memory_size);
+  if (memory_view.has_value()) {
+    absl::StatusOr<uint64_t> resident_memory_bytes =
+        GetResidentMemoryUsageBytes(*memory_view);
+    if (resident_memory_bytes.ok()) {
+      state.counters["WasmMemoryRss"] =
+          benchmark::Counter(*resident_memory_bytes,
+                             benchmark::Counter::kDefaults,
+                             benchmark::Counter::kIs1024);
+    } else {
+      state.SkipWithError(resident_memory_bytes.status().ToString());
+      return;
+    }
+  }
   state.counters["LogsSizeB"] =
       benchmark::Counter(context.logging_bytes(), benchmark::Counter::kDefaults,
                          benchmark::Counter::kIs1024);
